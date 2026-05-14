@@ -9,7 +9,7 @@ class Booktoki implements Plugin.PluginBase {
   name = '북토끼 (Booktoki)';
   icon = 'src/kr/booktoki/icon.png';
   site = 'https://sbxh1.com';
-  version = '2.0.0';
+  version = '2.0.1';
   static url: string | undefined;
   private static lastRequestTime = 0;
   private static readonly MIN_INTERVAL = 5000;
@@ -504,10 +504,17 @@ class Booktoki implements Plugin.PluginBase {
 
   async parseChapter(chapterPath: string): Promise<string> {
     await this.checkUrl(undefined);
-    const { body } = await this.fetchPage(`${Booktoki.url}/${chapterPath}`);
-    const $ = parseHTML(body);
+    const url = `${Booktoki.url}/${chapterPath}`;
+    const { body } = await this.fetchPage(url);
 
-    // sbxh1.com novel viewer
+    // sbxh1.com: XOR-encrypted API (novel-decryptor flow)
+    try {
+      const text = await this.fetchNovelApiContent(url, body);
+      if (text) return text;
+    } catch {}
+
+    // Fallback: article.novel-viewer in rendered HTML
+    const $ = parseHTML(body);
     let content = $('article.novel-viewer').html() || '';
 
     // Fallback: old html_data JS encoding (booktoki legacy)
@@ -524,26 +531,159 @@ class Booktoki implements Plugin.PluginBase {
       if (combined) content = this.decodeHtmlData(combined);
     }
 
-    // Fallback: static content divs
-    if (!content) {
+    if (!content)
       content = $('#novel_content').html() || $('.view-content').html() || '';
-    }
 
     if (content) {
       const $c = parseHTML(content);
       $c(
         'script, style, iframe, ins, [style*="display:none"], [style*="font-size:0"]',
       ).remove();
-      content = $c.html();
+      content = $c.html() || '';
     }
     return content || '본문을 불러올 수 없습니다.';
   }
 
+  // ── sbxh1.com API 복호화 (novel-decryptor 포팅) ──────────────────────────
+
+  private b64urlDecode(str: string): Uint8Array {
+    const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+    const b64 = str.replace(/-/g, '+').replace(/_/g, '/') + pad;
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  private b64urlEncode(bytes: Uint8Array): string {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  private xorDecrypt(payloadB64: string, keyB64: string): string {
+    const payload = this.b64urlDecode(payloadB64);
+    const key = this.b64urlDecode(keyB64);
+    const result = new Uint8Array(payload.length);
+    for (let i = 0; i < payload.length; i++)
+      result[i] = payload[i] ^ key[i % key.length];
+    return new TextDecoder().decode(result);
+  }
+
+  private async hmacSha256Sign(
+    secret: string,
+    message: string,
+  ): Promise<string> {
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw',
+      enc.encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign'],
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+    return this.b64urlEncode(new Uint8Array(sig));
+  }
+
+  private async fetchNovelApiContent(
+    chapterUrl: string,
+    html: string,
+  ): Promise<string | null> {
+    const idMatch = chapterUrl.match(/\/novel\/(\d+)\/(\d+)/);
+    if (!idMatch) return null;
+    const [, novelId, episodeId] = idMatch;
+
+    // JWT token은 페이지 HTML에 임베드됨
+    const tokenMatch = html.match(
+      /"token"\s*:\s*"(eyJ[A-Za-z0-9_\-]+[A-Za-z0-9_=.\-]*)"/,
+    );
+    if (!tokenMatch) return null;
+    const token = tokenMatch[1];
+
+    const baseUrl = Booktoki.url || this.site;
+    let cookies = storage.get('booktoki_full_cookies') || '';
+    const ua = storage.get('booktoki_cached_ua') || this.getUserAgent();
+
+    // nv 쿠키 추출 (XOR 키 소스)
+    const nvMatch = cookies.match(/(?:^|;\s*)nv=([^;]+)/);
+    let nvCookie = nvMatch ? decodeURIComponent(nvMatch[1]) : '';
+
+    // nv 쿠키가 없으면 서버에 발급 요청
+    if (!nvCookie) {
+      try {
+        const nvRes = await fetchApi(`${baseUrl}/api/nv-issue`, {
+          method: 'POST',
+          headers: {
+            Cookie: cookies,
+            Referer: `${baseUrl}/`,
+            'User-Agent': ua,
+          },
+        });
+        const setCookie = nvRes.headers.get('set-cookie') || '';
+        const m = setCookie.match(/(?:^|,\s*)nv=([^;,]+)/i);
+        if (m) {
+          nvCookie = decodeURIComponent(m[1]);
+          cookies = cookies ? `${cookies}; nv=${m[1]}` : `nv=${m[1]}`;
+          storage.set('booktoki_full_cookies', cookies);
+        }
+      } catch {}
+    }
+
+    if (!nvCookie) return null;
+    const xorKey = nvCookie.split('.')[0];
+
+    // 랜덤 nonce 생성
+    let nonceBytes: Uint8Array;
+    try {
+      nonceBytes = crypto.getRandomValues(new Uint8Array(24));
+    } catch {
+      nonceBytes = new Uint8Array(24);
+      const t = Date.now();
+      for (let i = 0; i < 8; i++) nonceBytes[i] = (t >>> (i * 8)) & 0xff;
+    }
+    const nonce = this.b64urlEncode(nonceBytes);
+
+    // HMAC-SHA256 proof
+    const proof = await this.hmacSha256Sign(
+      nvCookie,
+      `${token}.${nonce}.${ua}`,
+    );
+
+    // API 호출
+    const apiCookies = cookies.includes('nv=')
+      ? cookies
+      : `${cookies}; nv=${encodeURIComponent(nvCookie)}`;
+
+    const res = await fetchApi(`${baseUrl}/api/novel-content`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-novel-client': 'shadow-v2',
+        Cookie: apiCookies,
+        Referer: chapterUrl,
+        'User-Agent': ua,
+      },
+      body: JSON.stringify({ novelId, episodeId, token, nonce, proof }),
+    });
+
+    if (!res.ok) return null;
+    const data = JSON.parse(await res.text());
+    if (!data.ok || !data.payload) return null;
+
+    const plainText = this.xorDecrypt(data.payload, xorKey);
+    // 평문 텍스트 → HTML 문단 변환
+    return plainText
+      .split(/\n+/)
+      .filter(line => line.trim())
+      .map(line => `<p>${line}</p>`)
+      .join('\n');
+  }
+
   private decodeHtmlData(encoded: string): string {
     let result = '';
-    for (let i = 0; i < encoded.length; i += 3) {
+    for (let i = 0; i < encoded.length; i += 3)
       result += String.fromCharCode(parseInt(encoded.substring(i, i + 2), 16));
-    }
     return result;
   }
 
